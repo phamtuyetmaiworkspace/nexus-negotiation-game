@@ -127,7 +127,7 @@ def rpc(name, params):
 def get_games():
     return (
         q("nexus_games")
-        .select("id,name,class_label,current_period,market_open,game_status")
+        .select("id,name,class_label,current_period,market_open,game_status,team_login_visible,public_visible")
         .order("created_at", desc=True)
         .execute().data
     )
@@ -339,10 +339,18 @@ def render_market_tables(game_id, period):
         data = [{"Asset": r["Asset"], "International Market": r["Price"]} for r in rows if r["Category"] == category]
         st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
-def game_selector():
+def game_selector(include_test=False):
     games = get_games()
+    if not include_test:
+        games = [g for g in games if g.get("team_login_visible", True)]
     opts = {f'{g["name"]} · {g["game_status"].upper()}': g["id"] for g in games}
     return opts[st.selectbox("Game session", list(opts.keys()))]
+
+def get_public_game_id():
+    try:
+        return rpc("nexus_get_public_game", {})
+    except Exception:
+        return None
 
 def get_device_token():
     token = st.query_params.get("td")
@@ -375,7 +383,18 @@ def live_team_strip(team_id, game_id):
         st.session_state["_seen_period"] = current_period
     elif current_period != st.session_state["_seen_period"]:
         st.session_state["_seen_period"] = current_period
-        set_flash("period", "Thị trường mới đã được mở khóa. Hãy đọc bối cảnh trước khi đàm phán.", current_period)
+        if current_period == 4 or game.get("game_status") == "ended":
+            set_flash(
+                "period",
+                "FINAL REVEAL: P4 chỉ dùng để định giá danh mục cuối. Trade / Build / Sell đã kết thúc.",
+                4
+            )
+        else:
+            set_flash(
+                "period",
+                "Thời kỳ mới đã được mở khóa. Đọc bối cảnh, chuẩn bị BATNA rồi chờ GV mở Market.",
+                current_period
+            )
         st.rerun()
 
     latest = get_latest_completed(team_id, game_id)
@@ -487,21 +506,69 @@ def export_game_xlsx(game_id):
         score_rows.append({
             "Rank": s["final_rank"], "Team": team_name(s["team_id"]),
             "Mission": m["title"] if m else "",
-            "Metric": s["mission_metric"], "Multiplier": s["mission_multiplier"],
+            "Metric": s["mission_metric"], "Mission Level": s["mission_multiplier"],
             "Base Wealth": s["base_wealth"], "Mission Bonus": s["mission_bonus"],
             "Final Wealth": s["final_wealth"]
         })
 
     buf = io.BytesIO()
+
+    export_sheets = {
+        "Teams": pd.DataFrame(
+            team_rows,
+            columns=["Team", "Specialisation", "Members", "Cash"]
+        ),
+        "Transactions": pd.DataFrame(
+            tx_rows,
+            columns=[
+                "Period", "Type", "Proposer", "Counterparty",
+                "Proposer gives", "Counterparty gives",
+                "Status", "Reversed", "Created", "Completed", "Note"
+            ]
+        ),
+        "Builds": pd.DataFrame(
+            build_rows,
+            columns=[
+                "Period", "Team", "Output", "Quantity",
+                "Resource", "Skill", "Reversed", "Created"
+            ]
+        ),
+        "Final Inventory": pd.DataFrame(
+            inv_rows,
+            columns=[
+                "Team", "Asset", "Category", "Quantity",
+                "P4 Market Price", "P4 Value"
+            ]
+        ),
+        "Final Ranking": pd.DataFrame(
+            score_rows,
+            columns=[
+                "Rank", "Team", "Mission", "Metric", "Mission Level",
+                "Base Wealth", "Mission Bonus", "Final Wealth"
+            ]
+        ),
+    }
+
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        pd.DataFrame(team_rows).to_excel(writer, sheet_name="Teams", index=False)
-        pd.DataFrame(tx_rows).to_excel(writer, sheet_name="Transactions", index=False)
-        pd.DataFrame(build_rows).to_excel(writer, sheet_name="Builds", index=False)
-        pd.DataFrame(inv_rows).to_excel(writer, sheet_name="Final Inventory", index=False)
-        pd.DataFrame(score_rows).to_excel(writer, sheet_name="Final Ranking", index=False)
-        for sheet in writer.sheets.values():
+        for sheet_name, df in export_sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            sheet = writer.sheets[sheet_name]
+
+            # Robust even when the sheet has zero data rows.
+            n_rows = max(len(df), 1)
+            n_cols = max(len(df.columns), 1)
+
             sheet.freeze_panes(1, 0)
-            sheet.set_column(0, max(0, sheet.dim_colmax), 18)
+            sheet.autofilter(0, 0, n_rows, n_cols - 1)
+            sheet.set_column(0, n_cols - 1, 18)
+
+            for idx, col in enumerate(df.columns):
+                if col in {
+                    "Members", "Proposer gives", "Counterparty gives",
+                    "Note", "Mission"
+                }:
+                    sheet.set_column(idx, idx, 28)
+
     buf.seek(0)
     return buf.getvalue()
 
@@ -520,11 +587,16 @@ mode = st.sidebar.radio("Mode", ["🌐 Public Market & Directory", "🤝 Team", 
 # PUBLIC
 # =========================
 if mode == "🌐 Public Market & Directory":
-    game_id = game_selector()
+    game_id = get_public_game_id()
+    if not game_id:
+        st.warning("GV chưa chọn lớp để hiển thị trên Public Market.")
+        st.stop()
+
     game = get_game(game_id)
     st.markdown(
-        f'<div class="team-banner"><div class="team-title">{game["name"]}</div>'
-        f'<div class="team-sub">Status: {game["game_status"].upper()} · Market: '
+        f'<div class="team-banner"><div class="team-title">📡 PUBLIC MARKET · {game["name"]}</div>'
+        f'<div class="team-sub">Đây là lớp đang được GV chọn để phát công khai · '
+        f'Status: {game["game_status"].upper()} · Market: '
         f'{"🟢 OPEN" if game["market_open"] else "🔴 CLOSED"}</div></div>',
         unsafe_allow_html=True
     )
@@ -542,7 +614,7 @@ if mode == "🌐 Public Market & Directory":
 elif mode == "🤝 Team":
     if "team_id" not in st.session_state:
         st.markdown("## Team Login")
-        game_id = game_selector()
+        game_id = game_selector(include_test=False)
         c1, c2 = st.columns(2)
         team_no = c1.number_input("Team number", min_value=1, step=1)
         login_code = c2.text_input("Team Login Code", type="password")
@@ -607,7 +679,11 @@ elif mode == "🤝 Team":
         if score:
             c1, c2, c3 = st.columns(3)
             c1.metric("Base Wealth", int(score["base_wealth"]))
-            c2.metric("Secret Mission Bonus", int(score["mission_bonus"]), f'{score["mission_multiplier"]}×')
+            c2.metric(
+                "Secret Mission Bonus",
+                int(score["mission_bonus"]),
+                f'Level {int(score["mission_multiplier"])}' if int(score["mission_multiplier"]) > 0 else "Not completed"
+            )
             c3.metric("FINAL WEALTH", int(score["final_wealth"]))
             st.info("Xếp hạng cuối không hiển thị cho sinh viên. Chỉ giảng viên xem được ranking.")
         st.divider()
@@ -618,13 +694,28 @@ elif mode == "🤝 Team":
         mission = get_mission(team_id)
         if mission:
             metric = float(rpc("nexus_mission_metric", {"p_team_id": team_id}) or 0)
-            threshold = float(mission.get("threshold_value") or 0)
-            mult = min(int(mission.get("max_multiplier") or 3), int(metric // threshold) if threshold else 0)
+            t1 = float(mission.get("threshold_value") or 0)
+            t2 = float(mission.get("tier2_threshold") or 0)
+            t3 = float(mission.get("tier3_threshold") or 0)
+
+            if t3 and metric >= t3:
+                level, current_bonus = 3, 200
+            elif t2 and metric >= t2:
+                level, current_bonus = 2, 150
+            elif t1 and metric >= t1:
+                level, current_bonus = 1, 100
+            else:
+                level, current_bonus = 0, 0
+
+            next_target = t1 if level == 0 else (t2 if level == 1 else (t3 if level == 2 else None))
+            next_text = f' · <b>Next target:</b> {next_target:g}' if next_target else ' · <b>Max level reached</b>'
+
             st.markdown(
                 f"""<div class="mission"><strong>🔒 SECRET MISSION · {mission["title"]}</strong>
                 <p>{mission["description"]}</p>
-                <p><b>Base bonus:</b> +{int(float(mission["bonus_value"]))} ·
-                <b>Current progress:</b> {metric:g} · <b>Current multiplier:</b> {mult}× (max 3×)</p></div>""",
+                <p><b>Progress:</b> {metric:g} · <b>Current level:</b> {level} ·
+                <b>Current bonus:</b> +{current_bonus}{next_text}</p>
+                <p><b>Reward ladder:</b> Level 1 = +100 · Level 2 = +150 · Level 3 = +200</p></div>""",
                 unsafe_allow_html=True
             )
 
@@ -783,7 +874,7 @@ elif mode == "🤝 Team":
 # TEACHER
 # =========================
 else:
-    game_id = game_selector()
+    game_id = game_selector(include_test=True)
     pin = st.text_input("Teacher PIN", type="password")
     if pin != ADMIN_PIN:
         st.info("Enter Teacher PIN.")
@@ -797,10 +888,26 @@ else:
     )
     render_period_card(game["current_period"])
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Status", game["game_status"].upper())
     c2.metric("Period", game["current_period"])
     c3.metric("Market", "OPEN" if game["market_open"] else "CLOSED")
+    c4.metric("Public Display", "LIVE 📡" if game.get("public_visible") else "Hidden")
+
+    with st.container(border=True):
+        st.markdown("### 📡 Public Market Display")
+        st.caption(
+            "Chỉ MỘT lớp được hiển thị trên Public Market tại một thời điểm. "
+            "Sinh viên ở màn Public sẽ không thấy danh sách các lớp khác."
+        )
+        if game.get("public_visible"):
+            st.success(f'{game["name"]} đang được hiển thị trên Public Market.')
+        else:
+            if st.button("📡 Show this class on Public Market", type="primary", use_container_width=True):
+                rpc("nexus_set_public_game", {"p_game_id": game_id})
+                st.cache_data.clear()
+                set_flash("profile", f'Public Market đã chuyển sang {game["name"]}.')
+                st.rerun()
 
     if game["game_status"] == "setup":
         st.success("SETUP MODE: sinh viên có thể login, nhập tên và đọc mission; chưa thể giao dịch.")
@@ -819,28 +926,34 @@ else:
             st.rerun()
 
         if int(game["current_period"]) < 4:
+            is_final_step = int(game["current_period"]) == 3
             if c.button(
-                "⏭️ Advance Period",
+                "🏁 FINAL REVEAL P4" if is_final_step else "⏭️ Advance Period",
                 disabled=game["market_open"],
                 use_container_width=True,
-                help="Close Market first. Advancing adds +1 specialization token/team and keeps market closed."
+                help=(
+                    "Close Market first. P3→P4 immediately closes all trading and calculates Final Wealth."
+                    if is_final_step
+                    else "Close Market first. Advancing adds +1 specialization token/team and keeps market closed."
+                )
             ):
                 r = rpc("nexus_advance_period", {"p_game_id": game_id})
                 newp = int(r["new_period"])
-                set_flash("period", "Đã cộng +1 token chuyên môn cho mỗi team. Đọc bối cảnh rồi mở Market.", newp)
+                if bool(r.get("final_reveal")):
+                    set_flash(
+                        "period",
+                        "P4 đã được công bố. Không cộng token mới; mọi Trade / Build / Sell kết thúc và Final Wealth được chốt.",
+                        4
+                    )
+                else:
+                    set_flash(
+                        "period",
+                        "Đã cộng +1 token chuyên môn cho mỗi team. Đọc bối cảnh rồi mở Market.",
+                        newp
+                    )
                 st.rerun()
         else:
-            st.warning("Period IV. Khi hoàn tất hãy Close Market rồi END GAME.")
-            confirm = st.checkbox("Tôi xác nhận kết thúc game và khóa toàn bộ giao dịch.")
-            if st.button(
-                "🏁 END GAME & CALCULATE FINAL WEALTH",
-                type="primary",
-                disabled=(game["market_open"] or not confirm),
-                use_container_width=True
-            ):
-                rpc("nexus_end_game", {"p_game_id": game_id})
-                set_flash("market", "Game đã kết thúc. Final Wealth và Secret Mission Bonus đã được chốt.")
-                st.rerun()
+            st.info("P4 là FINAL REVEAL. Không có vòng giao dịch P4.")
 
     teams = q("nexus_teams").select("*").eq("game_id", game_id).order("team_no").execute().data
     _, by_id, _ = get_assets()
@@ -856,6 +969,22 @@ else:
             "Asset units": sum(x["quantity"] for x in get_inventory(t["id"]))
         })
     st.dataframe(pd.DataFrame(monitor), use_container_width=True, hide_index=True)
+
+    with st.expander("🧪 Team Login Visibility"):
+        st.caption(
+            "Cho phép server thử nghiệm xuất hiện hoặc biến mất khỏi danh sách Team Login. "
+            "Public Market được điều khiển riêng bằng mục 📡 Public Market Display."
+        )
+        if game.get("team_login_visible", True):
+            if st.button("🙈 Hide this server from Team Login", use_container_width=True):
+                q("nexus_games").update({"team_login_visible": False}).eq("id", game_id).execute()
+                st.cache_data.clear()
+                st.rerun()
+        else:
+            if st.button("👁️ Show this server in Team Login", use_container_width=True):
+                q("nexus_games").update({"team_login_visible": True}).eq("id", game_id).execute()
+                st.cache_data.clear()
+                st.rerun()
 
     with st.expander("🔐 Team Codes & Trader Device Control"):
         topts = {t["team_name"]: t["id"] for t in teams}
@@ -930,7 +1059,7 @@ else:
             rank.append({
                 "Rank": s["final_rank"], "Team": team_name(s["team_id"]),
                 "Base Wealth": s["base_wealth"], "Mission": m["title"] if m else "",
-                "Metric": s["mission_metric"], "Multiplier": f'{s["mission_multiplier"]}×',
+                "Metric": s["mission_metric"], "Mission Level": int(s["mission_multiplier"]),
                 "Bonus": s["mission_bonus"], "Final Wealth": s["final_wealth"]
             })
         st.dataframe(pd.DataFrame(rank), use_container_width=True, hide_index=True)
