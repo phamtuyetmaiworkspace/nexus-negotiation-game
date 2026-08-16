@@ -347,10 +347,28 @@ def game_selector(include_test=False):
     return opts[st.selectbox("Game session", list(opts.keys()))]
 
 def get_public_game_id():
+    """Read the currently broadcast class directly from the games table."""
     try:
-        return rpc("nexus_get_public_game", {})
+        rows = (
+            q("nexus_games")
+            .select("id")
+            .eq("public_visible", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0]["id"] if rows else None
     except Exception:
         return None
+
+def set_public_game(game_id):
+    """Teacher-only backend action: broadcast exactly one class on Public Market."""
+    # Streamlit uses the server-side Supabase secret key, so these writes bypass
+    # client-side RLS without exposing database credentials to students.
+    q("nexus_games").update({"public_visible": False}).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    q("nexus_games").update({"public_visible": True}).eq("id", game_id).execute()
+    return True
 
 def get_device_token():
     token = st.query_params.get("td")
@@ -904,10 +922,13 @@ else:
             st.success(f'{game["name"]} đang được hiển thị trên Public Market.')
         else:
             if st.button("📡 Show this class on Public Market", type="primary", use_container_width=True):
-                rpc("nexus_set_public_game", {"p_game_id": game_id})
-                st.cache_data.clear()
-                set_flash("profile", f'Public Market đã chuyển sang {game["name"]}.')
-                st.rerun()
+                try:
+                    set_public_game(game_id)
+                    st.cache_data.clear()
+                    set_flash("profile", f'Public Market đã chuyển sang {game["name"]}.')
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Không thể đổi Public Market: {e}")
 
     if game["game_status"] == "setup":
         st.success("SETUP MODE: sinh viên có thể login, nhập tên và đọc mission; chưa thể giao dịch.")
