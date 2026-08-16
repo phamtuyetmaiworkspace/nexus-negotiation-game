@@ -1,3 +1,2 @@
-streamlit>=1.38
-supabase>=2.10
-pandas>=2.2
+streamlit==1.60.0
+supabase==2.31.0
