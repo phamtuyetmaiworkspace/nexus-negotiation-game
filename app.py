@@ -194,9 +194,15 @@ def get_directory(game_id):
     out = []
     for t in teams:
         a = by_id[t["specialization_asset_id"]]
+        holdings = [
+            f'{x.get("emoji","")} {x["name"]}'
+            for x in get_inventory(t["id"])
+            if x["category"] in ("resource", "skill") and int(x["quantity"]) > 0
+        ]
         out.append({
             "Team": t["team_name"],
             "Specialisation": f'{a.get("emoji","")} {a["name"]}',
+            "Currently holds (type only)": ", ".join(holdings) if holdings else "—",
             "Members": ", ".join(m["full_name"] for m in get_members(t["id"]))
         })
     return out
@@ -216,6 +222,37 @@ def get_market_prices(game_id, period):
             "Price": r["buy_price"],
             "asset_id": r["asset_id"]
         })
+    return out
+
+
+def get_black_market_lots(game_id, period=None):
+    query = q("nexus_black_market_lots").select("*").eq("game_id", game_id)
+    if period is not None:
+        query = query.eq("period", int(period))
+    return query.order("created_at").execute().data
+
+
+def get_black_market_bids(lot_id):
+    return (
+        q("nexus_black_market_bids").select("*").eq("lot_id", lot_id)
+        .order("bid_price_per_unit", desc=True).order("created_at").execute().data
+    )
+
+
+def black_market_suggestions(lot, bids):
+    """Rank pending bids by unit price, then earlier bid time; allocate until supply is exhausted."""
+    pending = [b for b in bids if b.get("status") == "pending"]
+    pending.sort(key=lambda b: (-int(b["bid_price_per_unit"]), b.get("created_at") or ""))
+    remaining = int(lot.get("quantity_remaining") or 0)
+    out = []
+    for rank, b in enumerate(pending, start=1):
+        suggested = min(int(b["quantity_requested"]), remaining)
+        remaining -= suggested
+        row = dict(b)
+        row["rank"] = rank
+        row["suggested_quantity"] = suggested
+        row["suggested_cost"] = suggested * int(b["bid_price_per_unit"])
+        out.append(row)
     return out
 
 def get_mission(team_id):
@@ -529,6 +566,20 @@ def export_game_xlsx(game_id):
             "Final Wealth": s["final_wealth"]
         })
 
+    bm_rows = []
+    lots = get_black_market_lots(game_id)
+    for lot in lots:
+        asset = by_id[lot["asset_id"]]
+        for b in get_black_market_bids(lot["id"]):
+            bm_rows.append({
+                "Period": lot["period"], "Asset": asset["name"],
+                "Lot supply": lot["quantity_total"], "Lot remaining": lot["quantity_remaining"],
+                "Lot status": lot["status"], "Team": team_name(b["team_id"]),
+                "Qty wanted": b["quantity_requested"], "Bid / unit": b["bid_price_per_unit"],
+                "Bid status": b["status"], "Approved qty": b["approved_quantity"],
+                "Created": b["created_at"]
+            })
+
     buf = io.BytesIO()
 
     export_sheets = {
@@ -549,6 +600,13 @@ def export_game_xlsx(game_id):
             columns=[
                 "Period", "Team", "Output", "Quantity",
                 "Resource", "Skill", "Reversed", "Created"
+            ]
+        ),
+        "Black Market": pd.DataFrame(
+            bm_rows,
+            columns=[
+                "Period", "Asset", "Lot supply", "Lot remaining", "Lot status", "Team",
+                "Qty wanted", "Bid / unit", "Bid status", "Approved qty", "Created"
             ]
         ),
         "Final Inventory": pd.DataFrame(
@@ -688,6 +746,15 @@ elif mode == "🤝 Team":
     else:
         st.success("🔐 Trader Device ACTIVE — thiết bị này có quyền giao dịch/build/sell.")
 
+    # Claim any newly reached Secret Mission level during active gameplay.
+    # The server is idempotent: refreshing/opening multiple devices cannot pay twice.
+    mission_claim = None
+    if game["game_status"] == "in_progress" and int(game["current_period"]) <= 3:
+        try:
+            mission_claim = rpc("nexus_claim_mission_progress", {"p_team_id": team_id})
+        except Exception:
+            mission_claim = None
+
     live_team_strip(team_id, game_id)
     render_period_card(game["current_period"])
 
@@ -698,32 +765,49 @@ elif mode == "🤝 Team":
             c1, c2, c3 = st.columns(3)
             c1.metric("Base Wealth", int(score["base_wealth"]))
             c2.metric(
-                "Secret Mission Bonus",
+                "Mission Reward Earned",
                 int(score["mission_bonus"]),
-                f'Level {int(score["mission_multiplier"])}' if int(score["mission_multiplier"]) > 0 else "Not completed"
+                f'Level {int(score["mission_multiplier"])} · already included in Cash'
+                if int(score["mission_multiplier"]) > 0 else "Not completed"
             )
             c3.metric("FINAL WEALTH", int(score["final_wealth"]))
             st.info("Xếp hạng cuối không hiển thị cho sinh viên. Chỉ giảng viên xem được ranking.")
         st.divider()
 
-    tabs = st.tabs(["🏠 My Team", "🤝 Trade", "🛠️ Build", "🌍 Market", "🧾 History"])
+    tabs = st.tabs(["🏠 My Team", "🤝 Trade", "🛠️ Build", "🌍 Market", "🕳️ Black Market", "🧾 History"])
 
     with tabs[0]:
         mission = get_mission(team_id)
         if mission:
-            metric = float(rpc("nexus_mission_metric", {"p_team_id": team_id}) or 0)
             t1 = float(mission.get("threshold_value") or 0)
             t2 = float(mission.get("tier2_threshold") or 0)
             t3 = float(mission.get("tier3_threshold") or 0)
 
-            if t3 and metric >= t3:
-                level, current_bonus = 3, 200
-            elif t2 and metric >= t2:
-                level, current_bonus = 2, 150
-            elif t1 and metric >= t1:
-                level, current_bonus = 1, 100
+            if mission_claim:
+                metric = float(mission_claim.get("metric") or 0)
+                level = int(mission_claim.get("level") or 0)
+                current_bonus = int(mission_claim.get("total_bonus") or 0)
+                payout = int(mission_claim.get("payout") or 0)
             else:
-                level, current_bonus = 0, 0
+                metric = float(rpc("nexus_mission_metric", {"p_team_id": team_id}) or 0)
+                if t3 and metric >= t3:
+                    level, current_bonus = 3, 200
+                elif t2 and metric >= t2:
+                    level, current_bonus = 2, 150
+                elif t1 and metric >= t1:
+                    level, current_bonus = 1, 100
+                else:
+                    level, current_bonus = 0, 0
+                payout = 0
+
+            if payout > 0:
+                st.success(
+                    f"🎯 SECRET MISSION LEVEL {level} ACHIEVED! "
+                    f"+{payout} Credits have been added to your team cash. "
+                    f"Total Mission Reward earned: +{current_bonus} Credits."
+                )
+                st.toast(f"Mission Level {level}: +{payout} Credits!", icon="🎯")
+                st.balloons()
 
             next_target = t1 if level == 0 else (t2 if level == 1 else (t3 if level == 2 else None))
             next_text = f' · <b>Next target:</b> {next_target:g}' if next_target else ' · <b>Max level reached</b>'
@@ -732,8 +816,10 @@ elif mode == "🤝 Team":
                 f"""<div class="mission"><strong>🔒 SECRET MISSION · {mission["title"]}</strong>
                 <p>{mission["description"]}</p>
                 <p><b>Progress:</b> {metric:g} · <b>Current level:</b> {level} ·
-                <b>Current bonus:</b> +{current_bonus}{next_text}</p>
-                <p><b>Reward ladder:</b> Level 1 = +100 · Level 2 = +150 · Level 3 = +200</p></div>""",
+                <b>Total reward earned:</b> +{current_bonus}{next_text}</p>
+                <p><b>Reward ladder:</b> Level 1 = +100 · Level 2 = +50 more (150 total) ·
+                Level 3 = +100 more (250 total)</p>
+                <p>Mission rewards are added to <b>Cash immediately</b> and can be used in later negotiations.</p></div>""",
                 unsafe_allow_html=True
             )
 
@@ -881,6 +967,72 @@ elif mode == "🤝 Team":
             st.info("Không có asset để bán.")
 
     with tabs[4]:
+        st.markdown("### 🕳️ Black Market Auction")
+        st.caption(
+            "Chợ đen chỉ hoạt động ở P2–P3. GV công bố một lượng Resource/Skill giới hạn. "
+            "Mỗi team gửi số lượng muốn mua và giá bid trên MỖI UNIT. Bid của các team khác là bí mật."
+        )
+        if int(game["current_period"]) not in (2, 3):
+            st.info("Black Market chỉ xuất hiện trong Period 2 và Period 3.")
+        elif game["game_status"] != "running" or not game["market_open"]:
+            st.info("Black Market hiện đang đóng cùng Market.")
+        else:
+            lots = [x for x in get_black_market_lots(game_id, game["current_period"]) if x.get("status") == "open"]
+            if not lots:
+                st.info("GV chưa mở lô hàng Black Market nào trong period này.")
+            for lot in lots:
+                asset = by_id[lot["asset_id"]]
+                st.markdown(
+                    f'#### {asset.get("emoji","")} {asset["name"]} · Supply remaining: '
+                    f'**{lot["quantity_remaining"]}/{lot["quantity_total"]}**'
+                )
+                if lot.get("note"):
+                    st.caption(lot["note"])
+                mine = [b for b in get_black_market_bids(lot["id"]) if b["team_id"] == team_id]
+                mine = mine[0] if mine else None
+                if mine:
+                    if mine["status"] == "approved":
+                        st.success(
+                            f'Bid APPROVED · {mine["approved_quantity"]} unit(s) × '
+                            f'{mine["bid_price_per_unit"]} = '
+                            f'{int(mine["approved_quantity"])*int(mine["bid_price_per_unit"])} Credits'
+                        )
+                    elif mine["status"] == "pending":
+                        st.info(
+                            f'Current bid: {mine["quantity_requested"]} unit(s) × '
+                            f'{mine["bid_price_per_unit"]} Credits/unit · Waiting for teacher decision.'
+                        )
+                    elif mine["status"] == "rejected":
+                        st.warning("Previous bid was rejected. You may submit a new bid while the lot remains open.")
+
+                with st.form(f'bm_bid_{lot["id"]}'):
+                    default_q = int(mine["quantity_requested"]) if mine and mine["status"] != "approved" else 1
+                    default_p = int(mine["bid_price_per_unit"]) if mine and mine["status"] != "approved" else 1
+                    c1, c2 = st.columns(2)
+                    qty_bid = c1.number_input("Quantity wanted", min_value=1, value=max(1, default_q), step=1, key=f'bmq_{lot["id"]}')
+                    price_bid = c2.number_input("Bid price / unit", min_value=1, value=max(1, default_p), step=1, key=f'bmp_{lot["id"]}')
+                    st.caption(f'Maximum commitment if fully approved: {int(qty_bid)*int(price_bid)} Credits')
+                    submit = st.form_submit_button(
+                        "🔨 Submit / Update Bid",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=(not trader or (mine is not None and mine.get("status") == "approved"))
+                    )
+                if submit:
+                    try:
+                        require_trader(team_id)
+                        rpc("nexus_submit_black_market_bid", {
+                            "p_team_id": team_id,
+                            "p_lot_id": lot["id"],
+                            "p_quantity": int(qty_bid),
+                            "p_price_per_unit": int(price_bid)
+                        })
+                        set_flash("market", f'Black Market bid submitted: {int(qty_bid)} × {int(price_bid)} Credits/unit.')
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    with tabs[5]:
         tx = (
             q("nexus_transactions").select("*").eq("game_id", game_id)
             .or_(f"proposer_team_id.eq.{team_id},counterparty_team_id.eq.{team_id}")
@@ -978,6 +1130,134 @@ else:
 
     teams = q("nexus_teams").select("*").eq("game_id", game_id).order("team_no").execute().data
     _, by_id, _ = get_assets()
+
+    with st.expander("🕳️ Black Market Control", expanded=int(game["current_period"]) in (2, 3)):
+        st.caption(
+            "P2–P3 only. Create a limited Resource/Skill lot, open bidding, then review bids ranked by PRICE PER UNIT. "
+            "The server suggests allocation from highest price downward; teacher approval is always required."
+        )
+        bm_assets = [a for a in get_assets()[0] if a["category"] in ("resource", "skill")]
+        bm_asset_opts = {f'{a.get("emoji","")} {a["name"]} · {a["category"]}': a["id"] for a in bm_assets}
+        with st.form("create_black_market_lot"):
+            c1, c2, c3 = st.columns(3)
+            bm_period = c1.selectbox("Period", [2, 3], index=0 if int(game["current_period"]) != 3 else 1)
+            bm_asset_label = c2.selectbox("Resource / Skill", list(bm_asset_opts.keys()))
+            bm_qty = c3.number_input("Supply quantity", min_value=1, value=3, step=1)
+            bm_note = st.text_input("Optional note", placeholder="e.g. Emergency shipment / scarce import batch")
+            create_lot = st.form_submit_button("➕ Create Black Market Lot", use_container_width=True)
+        if create_lot:
+            q("nexus_black_market_lots").insert({
+                "game_id": game_id,
+                "period": int(bm_period),
+                "asset_id": bm_asset_opts[bm_asset_label],
+                "quantity_total": int(bm_qty),
+                "quantity_remaining": int(bm_qty),
+                "status": "draft",
+                "note": bm_note.strip() or None
+            }).execute()
+            st.success("Black Market lot created as DRAFT.")
+            st.rerun()
+
+        lots_all = get_black_market_lots(game_id)
+        if not lots_all:
+            st.info("No Black Market lots created yet.")
+        else:
+            lot_opts = {}
+            for lot in lots_all:
+                aa = by_id[lot["asset_id"]]
+                lot_opts[
+                    f'P{lot["period"]} · {aa.get("emoji","")} {aa["name"]} · '
+                    f'{lot["quantity_remaining"]}/{lot["quantity_total"]} left · {lot["status"].upper()}'
+                ] = lot["id"]
+            lot_label = st.selectbox("Manage lot", list(lot_opts.keys()), key="bm_manage_lot")
+            lot_id = lot_opts[lot_label]
+            lot = next(x for x in lots_all if x["id"] == lot_id)
+            aa = by_id[lot["asset_id"]]
+
+            s1, s2, s3 = st.columns(3)
+            can_open = (
+                int(game["current_period"]) == int(lot["period"])
+                and int(lot["period"]) in (2, 3)
+                and game["game_status"] == "running"
+                and int(lot["quantity_remaining"]) > 0
+            )
+            if s1.button("🟢 Open bidding", disabled=lot["status"] == "open" or not can_open, use_container_width=True):
+                q("nexus_black_market_lots").update({"status": "open"}).eq("id", lot_id).execute()
+                st.rerun()
+            if s2.button("🔴 Close bidding", disabled=lot["status"] == "closed", use_container_width=True):
+                q("nexus_black_market_lots").update({"status": "closed"}).eq("id", lot_id).execute()
+                st.rerun()
+            if s3.button("📝 Return to draft", disabled=lot["status"] == "draft", use_container_width=True):
+                q("nexus_black_market_lots").update({"status": "draft"}).eq("id", lot_id).execute()
+                st.rerun()
+
+            bids = get_black_market_bids(lot_id)
+            suggestions = black_market_suggestions(lot, bids)
+            suggestion_by_id = {x["id"]: x for x in suggestions}
+            rows = []
+            for b in bids:
+                sugg = suggestion_by_id.get(b["id"], {})
+                rows.append({
+                    "Rank": sugg.get("rank", ""),
+                    "Team": team_name(b["team_id"]),
+                    "Qty wanted": b["quantity_requested"],
+                    "Bid / unit": b["bid_price_per_unit"],
+                    "Max total": int(b["quantity_requested"])*int(b["bid_price_per_unit"]),
+                    "Suggested qty": sugg.get("suggested_quantity", ""),
+                    "Suggested cost": sugg.get("suggested_cost", ""),
+                    "Status": b["status"],
+                    "Approved qty": b["approved_quantity"]
+                })
+            if rows:
+                st.markdown(f'#### Bids for {aa.get("emoji","")} {aa["name"]}')
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption("Ranking rule: highest price/unit first; ties go to the earlier bid. Suggested allocation is advisory only.")
+
+                pending = [b for b in bids if b["status"] == "pending"]
+                if pending:
+                    bid_opts = {
+                        f'{team_name(b["team_id"])} · {b["quantity_requested"]} × {b["bid_price_per_unit"]}/unit': b["id"]
+                        for b in pending
+                    }
+                    bid_label = st.selectbox("Teacher decision", list(bid_opts.keys()), key="bm_teacher_bid")
+                    bid_id = bid_opts[bid_label]
+                    bid = next(b for b in pending if b["id"] == bid_id)
+                    suggested = int(suggestion_by_id.get(bid_id, {}).get("suggested_quantity", 0))
+                    max_approve = min(int(bid["quantity_requested"]), int(lot["quantity_remaining"]))
+                    if max_approve > 0:
+                        approved_qty = st.number_input(
+                            "Quantity to approve",
+                            min_value=1,
+                            max_value=max_approve,
+                            value=max(1, suggested) if suggested > 0 else 1,
+                            step=1,
+                            key="bm_approve_qty"
+                        )
+                        st.metric("Charge to team", int(approved_qty)*int(bid["bid_price_per_unit"]), "Credits")
+                        d1, d2 = st.columns(2)
+                        if d1.button("✅ Approve sale", type="primary", use_container_width=True):
+                            try:
+                                r = rpc("nexus_approve_black_market_bid", {
+                                    "p_bid_id": bid_id,
+                                    "p_approved_quantity": int(approved_qty)
+                                })
+                                st.success(
+                                    f'Approved {r["quantity"]} unit(s) at {r["unit_price"]}/unit · total {r["total_cost"]} Credits.'
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+                        if d2.button("❌ Reject bid", use_container_width=True):
+                            try:
+                                rpc("nexus_reject_black_market_bid", {"p_bid_id": bid_id})
+                                st.warning("Bid rejected.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+                    else:
+                        st.warning("No supply remains for approval.")
+            else:
+                st.info("No bids yet for this lot.")
 
     st.markdown("### 👥 Team Monitor")
     monitor = []
